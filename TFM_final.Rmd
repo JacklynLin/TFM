@@ -1,0 +1,594 @@
+---
+title: "tfm_final"
+author: "Jia Lin"
+date: "2025-06-06"
+output:
+  html_document: default
+  pdf_document: default
+---
+---
+title: "TFM"
+author: "Jia Lin"
+date: "2025-04-19"
+output:
+  pdf_document: 
+    latex_engine: xelatex
+  html_document: default
+---
+
+## Data Preprocessing
+
+```{r}
+library(readxl)
+library(dplyr)
+library(janitor)
+library(mitools)
+library(gsynth)
+library(CausalImpact)
+library(tibble)
+library(plm)
+library(lmtest)
+library(ggplot2)
+library(sandwich) 
+library(mice)
+library(corrplot)
+library(lubridate)
+library(tidyr)
+library(synthdid)
+library(Synth)
+library(estimatr)
+```
+
+```{r}
+haryana <- read_excel("Groundwater_Haryana 2017-2022.xlsx")
+punjab <- read_excel("Groundwater_punjab 2017 to 2022.xlsx")
+```
+
+
+1.  Which districts are included?
+
+```{r}
+haryana_districts <- haryana %>%
+  distinct(`District Name`) %>%
+  arrange(`District Name`)
+cat("Haryana has", nrow(haryana_districts), "districts:\n")
+print(haryana_districts)
+
+punjab_districts <- punjab %>%
+  distinct(`District Name`) %>%
+  arrange(`District Name`)
+cat("\nPunjab has", nrow(punjab_districts), "districts:\n")
+print(punjab_districts)
+```
+
+2.  What is the time span for each district?
+
+```{r}
+combined <- bind_rows(haryana, punjab)
+combined <- combined %>%
+  mutate(year = as.numeric(`Date Collection`),
+         post = ifelse(year >= 2020, 1, 0)) %>%
+  relocate(post, .before = 1)
+head(combined)
+
+district_year_unique <- combined %>%
+  mutate(`Date Collection` = as.numeric(`Date Collection`)) %>%      
+  distinct(`State Name`, `District Name`, `Date Collection`) %>%  
+  mutate(post = ifelse(`Date Collection` >= 2020, 1, 0))  
+district_year_unique
+
+district_post_pre_counts <- district_year_unique %>%
+  group_by(`State Name`, `District Name`, post) %>%
+  summarise(n_years = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(
+    names_from = post,
+    values_from = n_years,
+    names_prefix = "post_"
+  ) %>%
+  rename(pre_years = post_0, post_years = post_1) %>%
+  replace_na(list(pre_years = 0, post_years = 0))
+district_post_pre_counts
+
+districts_to_keep <- district_post_pre_counts %>%
+  filter(pre_years >= 3 & post_years >= 3) %>%
+  select(`State Name`, `District Name`)
+districts_to_keep
+
+combined <- combined %>%
+  semi_join(districts_to_keep, by = c("State Name", "District Name"))
+print(combined)
+
+combined %>%
+  distinct(`State Name`, `District Name`) %>%
+  count(`State Name`, name = "n_districts")
+
+excluded_districts <- bind_rows(haryana, punjab) %>%
+  distinct(`State Name`, `District Name`) %>%
+  anti_join(districts_to_keep, by = c("State Name", "District Name")) |> 
+  pull(`District Name`)
+excluded_districts
+```
+
+In my dataset, each district contains multiple water quality monitoring stations, and each station is theoretically measured once per year. This means that a single district may have several records for the same year. To determine whether a district actually has data in a given year, I kept only one record per district per year—removing duplicates—to avoid overcounting caused by having multiple stations. This gives a more accurate picture of data availability at the district level.
+
+Then, I calculated how many years of data each district has before (pre) and after (post) the policy intervention. I selected only those districts that have at least 3 years of data in both periods as the units for analysis. In the end, 19 districts from Haryana and 14 districts from Punjab met this requirement, which also satisfies the basic assumption of having at least 10 units per group.
+
+Additionally, I extracted the names of districts that did not meet the criteria into a vector. These excluded districts are: "Barnala", "Charkhi Dadri", "Moga", and "Tarn Taran", as they had too few years of data and were therefore removed from the analysis.
+
+## Data cleaning
+
+```{r}
+haryana[haryana == "-"] <- NA
+punjab[punjab == "-"] <- NA
+cols_to_drop <- c("Basin Name", "Sub Basin Name", "Agency Name")
+haryana <- haryana[, !colnames(haryana) %in% cols_to_drop]
+punjab  <- punjab[,  !colnames(punjab)  %in% cols_to_drop]
+```
+
+Replacing all "-" entries in the haryana and punjab datasets with NA (missing values).
+
+```{r}
+haryana <- haryana[, colSums(!is.na(haryana)) > 0]
+punjab <- punjab[, colSums(!is.na(punjab)) > 0]
+```
+
+Removing columns in the haryana and punjab datasets that contain only NA values.
+
+```{r}
+na_ratio_haryana <- colMeans(is.na(haryana))
+na_ratio_punjab  <- colMeans(is.na(punjab))
+threshold <- 0.6
+cols_haryana <- names(na_ratio_haryana)[na_ratio_haryana <= threshold]
+cols_punjab <- names(na_ratio_punjab)[na_ratio_punjab <= threshold]
+
+keep_cols <- intersect(cols_haryana, cols_punjab)
+
+haryana <- haryana[, keep_cols]
+punjab <- punjab[, keep_cols]
+
+sort(colMeans(is.na(haryana)), decreasing = TRUE)
+sort(colMeans(is.na(punjab)), decreasing = TRUE)
+
+
+
+
+```
+```{r}
+na_ratio_haryana <- colMeans(is.na(haryana))
+na_ratio_punjab  <- colMeans(is.na(punjab))
+
+na_summary <- data.frame(
+  Variable = names(na_ratio_haryana),
+  `Missing Rate (Haryana)` = round(na_ratio_haryana, 3),
+  `Missing Rate (Punjab)`  = round(na_ratio_punjab[names(na_ratio_haryana)], 3)
+)
+
+
+
+```
+
+
+
+
+
+
+
+```{r}
+haryana <- haryana %>%
+  rename(
+    station_name = `Station Name`,
+    state_name = `State Name`,
+    district_name = `District Name`,
+    year = `Date Collection`,
+    potassium = `Potassium (mg/L)`,
+    chloride = `Chloride (mg/L)`,
+    calcium = `Calcium (mg/L)`,
+    bicarbonate = `Bicarbonate (mg/L)`,
+    sulphate = `Sulphate (mg/L)`,
+    magnesium = `Magnesium (mg/L)`,
+    fluoride = `Fluoride (mg/L)`,
+    total_hardness = `Total Hardness (mg/L)`,
+    electrical_conductivity = `Electrical Conductivity (µS/cm) at 25°C)`,
+    sodium = `Sodium (mg/L)`,
+    iron = `Iron (mg/L)`,
+    silicate = `Silicate (SiO2) (mg/L)`,
+    ph = `pH`
+  )
+
+punjab <- punjab %>%
+  rename(
+    station_name = `Station Name`,
+    state_name = `State Name`,
+    district_name = `District Name`,
+    year = `Date Collection`,
+    potassium = `Potassium (mg/L)`,
+    chloride = `Chloride (mg/L)`,
+    calcium = `Calcium (mg/L)`,
+    bicarbonate = `Bicarbonate (mg/L)`,
+    sulphate = `Sulphate (mg/L)`,
+    magnesium = `Magnesium (mg/L)`,
+    fluoride = `Fluoride (mg/L)`,
+    total_hardness = `Total Hardness (mg/L)`,
+    electrical_conductivity = `Electrical Conductivity (µS/cm) at 25°C)`,
+    sodium = `Sodium (mg/L)`,
+    iron = `Iron (mg/L)`,
+    silicate = `Silicate (SiO2) (mg/L)`,
+    ph = `pH`
+  )
+```
+
+Rename both datasets
+
+
+Removed unneeded columns (like basin_name, sub_basin_name, and agency_name) from haryana and punjab data.
+
+```{r}
+numeric_vars <- c(
+   "potassium", "chloride", "calcium", "bicarbonate", "sulphate",
+  "magnesium", "fluoride", "total_hardness", "electrical_conductivity",
+  "sodium", "ph", "iron", "silicate"
+)
+
+haryana <- haryana %>%
+  mutate(across(all_of(numeric_vars), as.numeric),
+         across(-all_of(numeric_vars), as.character))
+
+punjab <- punjab %>%
+  mutate(across(all_of(numeric_vars), as.numeric),
+         across(-all_of(numeric_vars), as.character))
+
+str(punjab)
+str(haryana)
+```
+
+I first listed all the variable names that needed to be converted to numeric types, then converted those variables in the haryana and punjab data to numeric uniformly, and the rest of the variables to character uniformly, and then finally checked the structure of the two datasets with str() to make sure that the type conversion was successful.
+
+
+```{r}
+combination <- bind_rows(haryana, punjab)
+combination <- combination %>%
+  filter(!district_name %in% excluded_districts)
+
+combination <- bind_rows(haryana, punjab) 
+```
+
+
+```{r}
+combination$treated <- ifelse(combination$state_name == "Haryana", 1, 0)
+combination$post <- ifelse(combination$year >= 2020, 1, 0)
+
+combination2 <- combination %>%
+  group_by(state_name, district_name, year, treated, post) %>%
+  summarise(
+    across(potassium:ph, ~mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+The haryana and punjab datasets are first merged into a single combination, from which the districts in the excluded_district_names vector, i.e., the districts for which the previously filtered data are incomplete and do not meet the requirements of the analysis, are eliminated.
+
+
+
+```{r}
+variable_dict <- tibble(
+  name = c(
+    "station_name", "state_name", "district_name", "year",
+    "carbonate", "silicate", "potassium", "chloride", "calcium",
+    "bicarbonate", "sulphate", "magnesium", "fluoride",
+    "total_hardness", "electrical_conductivity", "sodium", "ph", "iron"
+  ),
+  description = c(
+    "Name of the groundwater sampling station",
+    "Name of the Indian state (Haryana or Punjab)",
+    "Name of the district where the sample was collected",
+    "Year when the water sample was collected",
+    "Carbonate concentration in water",
+    "Silicate concentration in water",
+    "Potassium concentration in water",
+    "Chloride concentration in water",
+    "Calcium concentration in water",
+    "Bicarbonate concentration in water",
+    "Sulphate concentration in water",
+    "Magnesium concentration in water",
+    "Fluoride concentration in water",
+    "Total hardness – due to calcium and magnesium ions",
+    "Electrical conductivity at 25°C – indicates ion concentration",
+    "Sodium concentration in water",
+    "pH level – acidity/alkalinity of water",
+    "Iron concentration in water"
+  ),
+  unit = c(
+    NA, NA, NA, "Year",
+    "mg/L", "mg/L", "mg/L", "mg/L", "mg/L",
+    "mg/L", "mg/L", "mg/L", "mg/L",
+    "mg/L", "µS/cm at 25°C", "mg/L", "—", "mg/L"
+  )
+)
+
+
+```
+
+Generated a variable description table.
+
+## Models
+### DID
+Baseline causal effect：
+```{r}
+set.seed(123)
+model_ec <- lm_robust(electrical_conductivity ~ treated * post, data = combination2, clusters = district_name)
+summary(model_ec)
+```
+
+
+Placebo test：
+```{r}
+set.seed(123)
+placebo_data <- subset(combination2, year %in% c(2017, 2018, 2019))
+placebo_data$fake_post <- ifelse(placebo_data$year >= 2018, 1, 0)
+placebo_model <- lm_robust(electrical_conductivity ~ treated * fake_post, data = placebo_data,
+                           clusters = district_name)
+summary(placebo_model)
+
+```
+
+```{r}
+
+placebo_data <- combination2 %>%
+  filter(year %in% c(2017, 2018, 2019)) %>%
+  mutate(year = as.numeric(year))
+
+ec_summary <- placebo_data %>%
+  group_by(state_name, year) %>%
+  summarise(mean_ec = mean(electrical_conductivity, na.rm = TRUE), .groups = "drop")
+
+max_2018 <- ec_summary %>% filter(year == 2018) %>% summarise(max_val = max(mean_ec)) %>% pull()
+f <- ggplot(ec_summary, aes(x = year, y = mean_ec, color = state_name)) +
+  geom_line(size = 0.7) +
+  geom_point(size = 1.5) +
+  geom_vline(xintercept = 2018, linetype = "dashed", color = "black") +
+  annotate("text", x = 2018, y = max_2018 + 150, 
+           label = "Placebo 'Policy'", hjust = 0, size = 4.2, fontface = "italic") +
+  scale_x_continuous(breaks = c(2017, 2018, 2019)) +
+  scale_y_continuous(limits = c(0, 3500)) +
+  scale_color_manual(
+    values = c("Haryana" = "#D55E00", "Punjab" = "#0072B2")  
+  ) +
+  labs(
+    x = "Year",
+    y = "Mean EC (μS/cm)",
+    color = "State"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+f
+
+```
+
+
+fixed-effect model：
+```{r}
+set.seed(123)
+model_fe <- plm(
+  electrical_conductivity ~ treated * post + factor(year),
+  data = combination2,
+  index = c("district_name", "year"),
+  model = "within"
+)
+summary(model_fe)
+
+vcov_cl <- vcovHC(model_fe, method = "arellano", cluster = "group")
+out_fe1 <-  coeftest(model_fe, vcov = vcov_cl)
+summary(out_fe1)
+
+```
+
+add more co-variabtes：
+```{r}
+set.seed(123)
+model_fe2 <- plm(electrical_conductivity ~ treated * post + factor(year) + chloride + sodium + ph,
+                 data = combination2,
+                 model = "within",
+                 index = c("district_name", "year"))
+summary(model_fe2)
+```
+
+
+```{r}
+vcov_cl2 <- vcovHC(model_fe2, method = "arellano", cluster = "group")
+out_fe2 <- coeftest(model_fe2, vcov = vcov_cl2)
+out_fe2
+summary(out_fe2)
+
+```
+
+### SDID
+```{r}
+set.seed(123)
+sdid_data <- combination %>%
+  group_by(district_name, year) %>%
+  summarise(electrical_conductivity = mean(electrical_conductivity), .groups = "drop")
+
+treated_districts <- combination %>%
+  filter(treated == 1) %>%
+  distinct(district_name) %>%
+  pull(district_name)
+
+sdid_data <- sdid_data %>%
+  mutate(
+    treated = ifelse(district_name %in% treated_districts, 1, 0),
+    post = ifelse(year >= 2020, 1, 0), 
+  )
+
+Y_wide <- sdid_data %>%
+  select(district_name, year, electrical_conductivity) %>%
+  pivot_wider(names_from = year, values_from = electrical_conductivity)
+
+Y <- as.matrix(Y_wide[,-1])
+rownames(Y) <- Y_wide$district_name
+
+control_units <- setdiff(rownames(Y), treated_districts)
+treated_units <- treated_districts
+Y <- Y[c(control_units, treated_units), ]
+
+Y <- apply(Y, 1, function(row) {
+  if (anyNA(row)) {
+    row[is.na(row)] <- mean(row, na.rm = TRUE)
+  }
+  return(row)
+})
+Y <- t(Y)  
+
+
+stopifnot(!anyNA(Y))
+
+colnames(Y) <- as.numeric(colnames(Y))
+Y <- Y[, order(as.numeric(colnames(Y)))]
+
+
+control_units <- setdiff(rownames(Y), treated_districts)
+treated_units <- treated_districts
+
+Y <- Y[c(control_units, treated_units), ]
+
+N0 <- length(control_units)          
+N1 <- length(treated_units)        
+T0 <- sum(as.numeric(colnames(Y)) < 2020) 
+
+```
+
+
+```{r}
+set.seed(123)
+result <- synthdid_estimate(Y, N0 = N0, T0 = T0)
+summary(result)
+k <- synthdid_plot(result)
+k
+
+
+att <- summary(result)$estimate
+se  <- summary(result)$se
+ci_lower <- att - 1.96 * 135.489
+ci_upper <- att + 1.96 * 135.489
+
+cat("ATT =", round(att, 4), " | 95% CI:", round(ci_lower, 4), "~", round(ci_upper, 4), "\n")
+
+```
+
+
+### CausalImpact package
+```{r}
+set.seed(123)
+haryana_ts <- haryana %>%
+  group_by(year) %>%
+  summarise(electrical_conductivity = mean(electrical_conductivity, na.rm = TRUE)) %>%
+  arrange(year) 
+
+haryana_ts$year <- as.numeric(haryana_ts$year)
+ts_mat <- as.matrix(haryana_ts$electrical_conductivity)
+rownames(ts_mat) <- haryana_ts$year
+
+pre.period <- c(1, 3)   
+post.period <- c(4, 6)   
+
+impact <- CausalImpact(ts_mat, pre.period, post.period)
+summary(impact)
+a <- plot(impact)
+a <- a + ylab("Electrical Conductivity (µS/cm)")
+summary_text <- capture.output(summary(impact))
+
+
+a <- a +
+  scale_x_continuous(breaks = 1:6, labels = 2017:2022) +
+  ylab("Electrical Conductivity (µS/cm)") +
+  theme(
+    axis.title.x = element_text(size = 10), 
+    axis.title.y = element_text(size = 10), 
+    axis.text.x  = element_text(size = 9),   
+    axis.text.y  = element_text(size = 9)   
+  )
+
+a
+```
+Using punjab as control group
+```{r}
+set.seed(123)
+ts <- combination %>%
+  group_by(year) %>%
+  summarise(
+    haryana_ec = mean(electrical_conductivity[treated == 1], na.rm = TRUE),
+    punjab_ec = mean(electrical_conductivity[treated == 0], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(year)
+
+
+ts_mat <- as.matrix(ts[, c("haryana_ec", "punjab_ec")])
+rownames(ts_mat) <- ts$year 
+
+pre.period <- c(1, 3)   
+post.period <- c(4, 6) 
+
+impact <- CausalImpact(ts_mat, pre.period, post.period)
+summary(impact)
+b <- plot(impact)
+
+
+b <- b +
+  scale_x_continuous(breaks = 1:6, labels = 2017:2022) +
+  ylab("Electrical Conductivity (µS/cm)") +
+  theme(
+    axis.title.x = element_text(size = 10),  
+    axis.title.y = element_text(size = 10), 
+    axis.text.x  = element_text(size = 9),  
+    axis.text.y  = element_text(size = 9)   
+  )
+
+b
+```
+
+Add covariates:
+```{r}
+set.seed(123)
+ts_add <- combination %>%
+  group_by(year) %>%
+  summarise(
+    haryana_ec = mean(electrical_conductivity[treated == 1], na.rm = TRUE),
+    punjab_ec = mean(electrical_conductivity[treated == 0], na.rm = TRUE),
+    chloride = mean(chloride, na.rm = TRUE),
+    sodium = mean(sodium, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(year)
+
+ts_mat_add <- as.matrix(ts_add[, -1])  
+rownames(ts_mat_add) <- ts_add$year
+
+pre.period <- c(1, 3)  
+post.period <- c(4, 6) 
+
+impact <- CausalImpact(ts_mat_add, pre.period, post.period)
+summary(impact)
+
+c <- plot(impact)
+
+
+c <- c +
+  scale_x_continuous(breaks = 1:6, labels = 2017:2022) +
+  ylab("Electrical Conductivity (µS/cm)") +
+  theme(
+    axis.title.x = element_text(size = 10),  
+    axis.title.y = element_text(size = 10), 
+    axis.text.x  = element_text(size = 9),   
+    axis.text.y  = element_text(size = 9)    
+  )
+
+c
+```
+
+
